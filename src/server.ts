@@ -112,15 +112,15 @@ wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
   console.log("WebSocket connection established for CallId:", callId);
 
   ws.on("message", (message: string) => {
-    const decodedMessage = Buffer.from(message, 'base64').toString('utf-8');
-    const parsedMessage = JSON.parse(decodedMessage);
-    if(parsedMessage.event === "media" && parsedMessage.media){
-      const media = parsedMessage.media;
-      const chunk = media.payload;
+    const base64Message = Buffer.from(message, 'base64').toString('utf-8');
+    const jsonMessage = JSON.parse(base64Message);
+    if (jsonMessage.event === "media" && jsonMessage.media) {
+      const mediaData = jsonMessage.media;
+      const mediaChunk = mediaData.payload;
 
-      console.log("Received media chunk:", chunk);
+      console.log("Received media chunk:", mediaChunk);
     }
-    if(parsedMessage.event === "stop"){
+    if (jsonMessage.event === "stop") {
       console.log("Received stop command");
       ws.close();
     }
