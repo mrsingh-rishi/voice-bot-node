@@ -5,8 +5,9 @@ import { WebSocket } from "ws";
 import http from "http";
 import { URL } from "url";
 import { createClient, ListenLiveClient, LiveTranscriptionEvents } from "@deepgram/sdk";
-
 dotenv.config();
+import OpenAI from "openai";
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,8 +23,18 @@ const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ noServer: true });
 let deepgramWs: ListenLiveClient;
-
+const assistantScript = `You are Matilda, a virtual assistant. You are friendly and helpful. You can answer questions, provide information, and assist with tasks. Always be polite and professional.`;
 app.use(express.json());
+let conversationHistory: Message[] = [];
+conversationHistory.push({
+  role: "system",
+  content: assistantScript,
+})
+// types for messages
+interface Message {
+  role: "system" |"user" | "assistant";
+  content: string;
+}
 
 // Basic health route
 app.get("/", (_req: Request, res: Response) => {
@@ -113,10 +124,15 @@ server.on("upgrade", (request, socket, head) => {
 
       deepgramWs.on(LiveTranscriptionEvents.Transcript, (data) => {
         console.log("Deepgram Transcript:");
-        console.log(data.channel.alternatives[0]?.transcript);
+        // console.log(data);
         const transcript = data.channel.alternatives[0]?.transcript;
-        if(transcript) {
-          // send transcript to openAI here
+        if(transcript && data.speech_final) {
+          console.log("Final Transcript:", transcript);
+          const response = generateResponse(transcript);
+          response.then((message) => {
+            console.log("Assistant response:", message);
+          }
+          );
         }
       });
 
@@ -160,6 +176,16 @@ wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
       // Handle stop command if sent.
       if (jsonMessage.event === "stop") {
         console.log("Received stop command");
+        // Close the Deepgram connection.
+        if (deepgramWs) {
+          deepgramWs.finish();
+        }
+        // empty the message history
+        conversationHistory = [];
+        conversationHistory.push({
+          role: "system",
+          content: assistantScript,
+        });
         ws.close();
       }
     } catch (err) {
@@ -169,11 +195,7 @@ wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
 
   ws.on("close", () => {
     console.log("WebSocket connection closed for CallId:", callId);
-    // Optionally, you can also close the Deepgram connection here.
-    const dgWs: ListenLiveClient = (ws as any).deepgramWs;
-    if (dgWs) {
-      dgWs.finish();
-    }
+    deepgramWs.finish();
   });
 });
 
@@ -181,3 +203,35 @@ wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
 server.listen(PORT, () => {
   console.log(`Server is running on ${baseUrl}`);
 });
+
+
+const generateResponse = async (transcript: string): Promise<string> => {
+  const messages = updateConversationHistory({ role: "user", content: transcript });
+  try {
+    const response = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages,
+      max_tokens: 100,
+    });
+
+    const messageContent = response.choices[0]?.message?.content;
+    if (!messageContent) {
+      throw new Error("No message content found");
+    }
+
+    console.log("Generated response:", messageContent);
+    updateConversationHistory({ role: "assistant", content: messageContent });
+    return messageContent;
+  } catch (error) {
+    console.error("Error generating response:", error);
+    const fallbackMessage = "Sorry, I couldn't process your request.";
+    updateConversationHistory({ role: "assistant", content: fallbackMessage });
+    console.log("Generated fallback response:", fallbackMessage);
+    return fallbackMessage;
+  }
+};
+
+const updateConversationHistory = ({ content, role }: { content: string; role: "user" | "assistant" }): Message[] => {
+  conversationHistory.push({ role, content });
+  return conversationHistory;
+};
