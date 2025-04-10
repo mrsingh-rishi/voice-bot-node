@@ -5,8 +5,10 @@ import { WebSocket } from "ws";
 import http from "http";
 import { URL } from "url";
 import { createClient, ListenLiveClient, LiveTranscriptionEvents } from "@deepgram/sdk";
+import { ElevenLabsClient, play } from "elevenlabs";
 dotenv.config();
 import OpenAI from "openai";
+
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
 const app = express();
@@ -18,6 +20,11 @@ const twilioClient = new Twilio(
 const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
 const baseWsUrl = process.env.BASE_WS_URL || `wss://localhost:${PORT}`;
 const deepgram = createClient(process.env.DEEPGRAM_API_KEY);
+const elevenlabClient = new ElevenLabsClient({
+  apiKey: process.env.ELEVENLABS_API_KEY,
+});
+let connectedWss: WebSocket;
+let streamId: string | null = null;
 
 // Create HTTP server and WebSocket server using noServer so that we can handle upgrade manually.
 const server = http.createServer(app);
@@ -60,6 +67,9 @@ app.post("/create-call", async (req: Request, res: Response): Promise<void> => {
       machineDetectionTimeout: 30,
       to,
       from: process.env.TWILIO_PHONE_NUMBER as string,
+      record: true, // Enable call recording
+      recordingStatusCallback: `${baseUrl}/status`, // Optional: Callback for recording status updates
+      recordingStatusCallbackMethod: "POST", // Optional: HTTP method for recording status callback
     });
     res.status(200).json({ callSid: call.sid });
   } catch (error) {
@@ -85,12 +95,17 @@ app.get("/voice", (req: Request, res: Response) => {
   const callId = req.query.CallId || '';
   const twiml = `
 <Response>
-  <Start>
-    <Stream url="${baseWsUrl}/stream?CallId=${callId}" />
-  </Start>
-  <Say voice="alice">Hello, this is Matilda. How may I help you?</Say>
-  <Pause length="60"/>
+  <Connect>
+    <Stream url="${baseWsUrl}/stream?CallId=${callId}" bidirectional="true" />
+  </Connect>
 </Response>`;
+//   const twiml = `
+// <?xml version="1.0" encoding="UTF-8"?>
+// <Response>
+//   <Connect>
+//     <Stream url="${baseWsUrl}/stream?CallId=${callId}" />
+//   </Connect>
+// </Response>`;
   res.type("text/xml");
   res.send(twiml);
 });
@@ -123,14 +138,17 @@ server.on("upgrade", (request, socket, head) => {
       });
 
       deepgramWs.on(LiveTranscriptionEvents.Transcript, (data) => {
-        console.log("Deepgram Transcript:");
         // console.log(data);
         const transcript = data.channel.alternatives[0]?.transcript;
         if(transcript && data.speech_final) {
           console.log("Final Transcript:", transcript);
           const response = generateResponse(transcript);
           response.then((message) => {
-            console.log("Assistant response:", message);
+            speak(message, connectedWss).then(() => {
+              
+            }).catch((error) => {
+              console.error("Error sending audio:", error);
+            });
           }
           );
         }
@@ -155,15 +173,21 @@ server.on("upgrade", (request, socket, head) => {
 
 // WebSocket connection handler with proper query parsing
 wss.on("connection", (ws: WebSocket, request: http.IncomingMessage) => {
+  connectedWss = ws;
   // Parse the query parameters from the request URL.
   const parsedUrl = new URL(request.url || "", `http://${request.headers.host}`);
   const callId = parsedUrl.searchParams.get("CallId") || "";
   console.log("WebSocket connection established for CallId:", callId);
-
+  speak("Hello! This is Matilda, your virtual assistant. How can I assist you today?", ws).then(() => {
+    console.log("Initial greeting sent.");
+  }).catch((error) => {
+    console.error("Error sending initial greeting:", error);
+  });
   ws.on("message", (message: string) => {
     try {
       // Parse the incoming message as JSON.
       const jsonMessage = JSON.parse(message);
+      streamId = jsonMessage.streamSid;
       // Check for Twilio "media" event.
       if (jsonMessage.event === "media" && jsonMessage.media && jsonMessage.media.payload) {
         // Decode the base64 audio payload into a Buffer.
@@ -234,4 +258,57 @@ const generateResponse = async (transcript: string): Promise<string> => {
 const updateConversationHistory = ({ content, role }: { content: string; role: "user" | "assistant" }): Message[] => {
   conversationHistory.push({ role, content });
   return conversationHistory;
+};
+
+const speak = async (text: string, ws: WebSocket): Promise<void> => {
+  try {
+    // Request the audio stream with timestamps from ElevenLabs.
+    const audio = await elevenlabClient.textToSpeech.streamWithTimestamps(
+      "21m00Tcm4TlvDq8ikWAM",  // your voice ID
+      { 
+        text, 
+        output_format: "ulaw_8000", 
+        model_id: "eleven_multilingual_v2",
+        enable_logging: true
+      }
+    );
+    
+    console.log("Audio stream started");
+
+    // Iterate over the asynchronous stream of audio chunks.
+    for await (const item of audio) {
+      // Each audio chunk from ElevenLabs is expected to contain a base64-encoded audio string.
+      const payload = {
+        event: "media",
+        streamSid: streamId,
+        media: {
+          payload: item.audio_base64
+        }
+      };
+
+      console.log("Sending payload to Twilio:");
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify(payload));
+      } else {
+        console.warn("WebSocket is not open. Could not send payload.");
+      }
+    }
+
+    // After all chunks have been sent, send a mark event to indicate the end of the audio stream.
+    const markPayload = {
+      event: "mark",
+      streamSid: streamId,
+      mark: {
+        name: "audio chunks sent"
+      }
+    };
+    
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify(markPayload));
+    }
+    console.log("Audio stream ended and mark event sent.");
+    
+  } catch (error) {
+    console.error("Error in speak function:", error);
+  }
 };

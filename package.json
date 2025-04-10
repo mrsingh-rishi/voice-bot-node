@@ -22,6 +22,7 @@
     "@deepgram/sdk": "^3.11.3",
     "axios": "^1.8.4",
     "dotenv": "^16.4.7",
+    "elevenlabs": "^1.56.0",
     "express": "^5.1.0",
     "openai": "^4.92.1",
     "socket.io": "^4.8.1",
